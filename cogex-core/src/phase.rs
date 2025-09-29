@@ -1,5 +1,5 @@
 /// Defines experiment phases and behavior
-pub trait Phase: Clone + PartialEq + Send + Sync + std::fmt::Debug + Default {
+pub trait Phase: Copy + Clone + PartialEq + Send + Sync + std::fmt::Debug + Default {
     fn allows_input(&self) -> bool;
     fn requires_calibration(&self) -> bool;
     fn next(&self) -> Option<Self>;
@@ -16,7 +16,7 @@ pub trait Phase: Clone + PartialEq + Send + Sync + std::fmt::Debug + Default {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Copy, Debug, Clone, PartialEq)]
 pub enum StandardPhase {
     Welcome,
     Calibration,

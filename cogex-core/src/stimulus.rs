@@ -1,6 +1,8 @@
+use cogex_cache::intern_text;
 /// Defines stimuli and their render data
 pub trait Stimulus: Clone + Send + Sync + std::fmt::Debug {
-    fn identifier(&self) -> &'static str;
+    fn cache_id(&self) -> usize;
+    fn is_text(&self) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,7 +22,7 @@ pub enum StimulusType {
         color: [u8; 4],
     },
     Text {
-        content: String,
+        content: &'static str,
         size: f32,
         color: [u8; 4],
     },
@@ -35,12 +37,16 @@ pub enum ArrowDirection {
 }
 
 impl Stimulus for StimulusType {
-    fn identifier(&self) -> &'static str {
+    fn cache_id(&self) -> usize {
         match self {
-            StimulusType::Circle { .. } => "circle",
-            StimulusType::Rectangle { .. } => "rectangle",
-            StimulusType::Arrow { .. } => "arrow",
-            StimulusType::Text { .. } => "text",
+            StimulusType::Circle { .. } => 0,
+            StimulusType::Rectangle { .. } => 1,
+            StimulusType::Arrow { .. } => 2,
+            StimulusType::Text { content, .. } => 3 + intern_text(content), // Add more variants here, ensuring unique IDs.
         }
+    }
+
+    fn is_text(&self) -> bool {
+        matches!(self, StimulusType::Text { .. })
     }
 }

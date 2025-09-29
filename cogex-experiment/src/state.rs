@@ -6,6 +6,16 @@ use rand::Rng;
 use std::marker::PhantomData;
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExperimentEvent {
+    SpacePressed,
+    CalibrationComplete,
+    TrialComplete,
+    PhaseComplete,
+    ResponseReceived,
+    Timeout,
+}
+
 pub struct ExperimentStateMachine<P, S, T, R>
 where
     P: Phase,
@@ -19,9 +29,11 @@ where
     pub config: ExperimentConfig<P>,
     pub current: Option<Trial<S, T::Timestamp>>,
     pub trial_number: usize,
+    pub phase_trial_number: usize,
     pub results: Vec<TrialResult<S>>,
     pub calibrated: bool,
     pub safe_margin_ns: u64,
+    pub awaiting_input: bool,
 }
 
 impl<P, T, R> ExperimentStateMachine<P, StimulusType, T, R>
@@ -38,15 +50,20 @@ where
             config,
             current: None,
             trial_number: 0,
+            phase_trial_number: 0,
             results: Vec::new(),
             calibrated: false,
             safe_margin_ns: 0,
+            awaiting_input: true,
         }
     }
 
     pub fn advance_phase(&mut self) -> bool {
         if let Some(next) = self.phase.next() {
             self.phase = next;
+            self.phase_trial_number = 0;
+            self.awaiting_input = self.phase.is_welcome();
+
             true
         } else {
             false
@@ -58,7 +75,7 @@ where
         self.safe_margin_ns = (stats.jitter_ns * 3.0) as u64;
         self.calibrated = true;
         // Add margin to stimulus duration for safety
-        self.config.stimulus_duration_ms += self.safe_margin_ns / 1_000_000;
+        // self.config.stimulus_duration_ms += self.safe_margin_ns / 1_000_000;
         println!(
             "Calibration: {:.3} ms/frame, {:.1} Hz, jitter {:.3} ms, safe margin {} ns",
             stats.average_frame_time_ns / 1_000_000.0,
@@ -100,33 +117,135 @@ where
         println!("Trial {} started at {:?} ns", id, now_ns);
     }
 
-    pub fn update(&mut self) {
+    pub fn update(&mut self) -> Vec<ExperimentEvent> {
+        let mut events = Vec::new();
+
+        // Handle phase-specific logic
+        match self.phase {
+            phase if phase.is_welcome() => {
+                // Waiting for space press - no automatic updates
+                return events;
+            }
+            phase if phase.requires_calibration() => {
+                if self.timer.frame_count() >= 120 && !self.calibrated {
+                    events.push(ExperimentEvent::CalibrationComplete);
+                    println!("hello from state machine update fn to stop calibration")
+                }
+            }
+            phase if phase.is_practice() || phase.is_experiment() => {
+                // Handle trial-level updates
+                self.update_trial(&mut events);
+
+                // Check if phase is complete
+                let target_trials = if phase.is_practice() {
+                    self.config.practice_trials
+                } else {
+                    self.config.experiment_trials
+                };
+
+                if self.phase_trial_number >= target_trials {
+                    events.push(ExperimentEvent::PhaseComplete);
+                }
+            }
+            _ => {
+                // Other phases (like Debrief) - handle as needed
+            }
+        }
+
+        events
+    }
+
+    pub fn handle_event(&mut self, event: ExperimentEvent) -> bool {
+        match (&self.phase, &event) {
+            // Welcome phase - space advances to calibration
+            (phase, ExperimentEvent::SpacePressed) if phase.is_welcome() => {
+                if self.advance_phase() {
+                    self.awaiting_input = false;
+                    true
+                } else {
+                    false
+                }
+            }
+
+            // Calibration complete - advance to practice and start first trial
+            (phase, ExperimentEvent::CalibrationComplete) if phase.requires_calibration() => {
+                self.apply_calibration();
+                if self.advance_phase() {
+                    self.phase_trial_number = 0;
+                    self.start_trial();
+                    true
+                } else {
+                    false
+                }
+            }
+
+            // Response received during response window
+            (phase, ExperimentEvent::ResponseReceived)
+                if (phase.is_practice() || phase.is_experiment())
+                    && self
+                        .current
+                        .as_ref()
+                        .map_or(false, |t| TrialState::Response == t.state) =>
+            {
+                self.record_response();
+                true
+            }
+
+            // Trial completed - start next or advance phase
+            (phase, ExperimentEvent::TrialComplete)
+                if phase.is_practice() || phase.is_experiment() =>
+            {
+                self.complete_current_trial(Some(self.timer.now()));
+                true
+            }
+
+            // Phase completed - advance to next phase
+            (_, ExperimentEvent::PhaseComplete) => {
+                if self.advance_phase() {
+                    self.phase_trial_number = 0;
+
+                    // Start trial if entering practice/experiment phase
+                    if self.phase.is_practice() || self.phase.is_experiment() {
+                        self.start_trial();
+                    }
+                    true
+                } else {
+                    // Experiment is complete
+                    false
+                }
+            }
+
+            _ => false, // Event not handled
+        }
+    }
+
+    fn update_trial(&mut self, events: &mut Vec<ExperimentEvent>) {
         if !self.calibrated {
-            // Calibration not complete, skip trial updates
             return;
         }
 
         let now_ns = self.timer.now();
-
         if let Some(trial) = &mut self.current {
             match trial.state {
                 TrialState::Fixation => {
                     if now_ns - trial.timestamps.fixation_start
                         >= trial.durations.fixation_ms * 1_000_000
                     {
-                        trial.state = TrialState::Stimulus;
+                        trial.state = TrialState::Response;
                         trial.timestamps.stimulus_start = Some(now_ns);
                         println!("Stimulus started at {}", now_ns);
+
+                        println!("Response window opened at {}", now_ns);
                     }
                 }
                 TrialState::Stimulus => {
-                    let dur_ns = trial.durations.stimulus_ms * 1_000_000 + self.safe_margin_ns;
-                    if let Some(start_ns) = trial.timestamps.stimulus_start {
-                        if now_ns - start_ns >= dur_ns {
-                            trial.state = TrialState::Response;
-                            println!("Response window opened at {}", now_ns);
-                        }
-                    }
+                    // if let Some(start_ns) = trial.timestamps.stimulus_start {
+                    //     if now_ns - start_ns >= dur_ns {
+                    //         trial.state = TrialState::Response;
+                    //         println!("Response window opened at {}", now_ns);
+                    //     }
+                    // }
+                    unreachable!("Should transition directly from Fixation to Response")
                 }
                 TrialState::Response => {
                     let total_ns = (trial.durations.stimulus_ms
@@ -135,7 +254,8 @@ where
                         + self.safe_margin_ns;
                     if let Some(start_ns) = trial.timestamps.stimulus_start {
                         if now_ns - start_ns >= total_ns {
-                            self.complete_trial(None);
+                            // Timeout - no response received
+                            events.push(ExperimentEvent::TrialComplete);
                         }
                     }
                 }
@@ -148,11 +268,11 @@ where
                         + self.safe_margin_ns;
                     if now_ns - trial.timestamps.start >= total_ns {
                         trial.state = TrialState::Complete;
-                        self.next_trial();
+                        events.push(ExperimentEvent::TrialComplete);
                     }
                 }
                 TrialState::Complete => {
-                    // waiting for next trial
+                    // Already complete
                 }
             }
         }
@@ -161,7 +281,7 @@ where
     /// Records a response for the current trial during the Response state
     pub fn record_response(&mut self) {
         if let Some(trial) = &mut self.current {
-            if trial.state == TrialState::Response {
+            if TrialState::Response == trial.state {
                 let now_ns = self.timer.now();
                 trial.timestamps.response = Some(now_ns);
                 trial.state = TrialState::Feedback;
@@ -172,13 +292,12 @@ where
                     now_ns,
                     rt as f64 / 1_000_000.0
                 );
-                self.complete_trial(Some(now_ns));
             }
         }
     }
 
     /// Completes the current trial and stores the results
-    fn complete_trial(&mut self, timestamp: Option<T::Timestamp>) {
+    fn complete_current_trial(&mut self, timestamp: Option<T::Timestamp>) {
         if let Some(trial) = &self.current {
             let reaction_ns = trial
                 .timestamps
@@ -188,7 +307,7 @@ where
 
             let result = TrialResult {
                 trial_id: trial.id,
-                stimulus_type: trial.stimulus.identifier().to_string(),
+                stimulus_type: trial.stimulus.cache_id().to_string(),
                 reaction_time_ns: reaction_ns,
                 correct: Some(correct),
                 timestamp_ns: timestamp.unwrap_or_default(),
@@ -197,23 +316,22 @@ where
 
             self.results.push(result);
         }
-    }
-
-    /// Proceeds to the next trial or advances phase upon completion
-    fn next_trial(&mut self) {
-        self.trial_number += 1;
         self.current = None;
+        self.trial_number += 1;
+        self.phase_trial_number += 1;
 
         self.timer
             .sleep(Duration::from_millis(self.config.inter_trial_interval_ms));
 
-        if self.phase.is_practice() /* Should match Practice phase */ && self.trial_number >= self.config.practice_trials
-        {
-            self.advance_phase();
-        } else if self.phase.is_experiment() /* Should match Experiment phase */ && self.trial_number >= self.config.experiment_trials
-        {
-            self.advance_phase();
+        let target_trials = if self.phase.is_practice() {
+            self.config.practice_trials
+        } else if self.phase.is_experiment() {
+            self.config.experiment_trials
         } else {
+            0
+        };
+
+        if self.trial_number < target_trials {
             self.start_trial();
         }
     }
@@ -236,7 +354,7 @@ where
                 color: [0, 0, 255, 255],
             },
             _ => StimulusType::Text {
-                content: "Test".to_string(),
+                content: "Test",
                 size: 24.0,
                 color: [255, 255, 255, 255],
             },
@@ -265,8 +383,43 @@ where
         self.current.as_ref().map(|t| (&t.stimulus, t.position))
     }
 
+    pub fn is_awaiting_input(&self) -> bool {
+        self.awaiting_input || self.phase.is_welcome()
+    }
+
+    pub fn should_show_stimulus(&self) -> bool {
+        self.current
+            .as_ref()
+            .map_or(false, |t| TrialState::Stimulus == t.state)
+    }
+
+    pub fn should_show_fixation(&self) -> bool {
+        self.current
+            .as_ref()
+            .map_or(false, |t| TrialState::Fixation == t.state)
+    }
+    pub fn should_show_feedback(&self) -> bool {
+        self.current
+            .as_ref()
+            .map_or(false, |t| TrialState::Feedback == t.state)
+    }
+
     /// Experiment results
     pub fn results(&self) -> &Vec<TrialResult<StimulusType>> {
         &self.results
+    }
+
+    pub fn current_trial_state(&self) -> Option<&TrialState> {
+        self.current.as_ref().map(|trial| &trial.state)
+    }
+
+    pub fn trial_progress(&self) -> Option<(usize, usize)> {
+        if self.phase.is_practice() {
+            Some((self.phase_trial_number + 1, self.config.practice_trials))
+        } else if self.phase.is_experiment() {
+            Some((self.phase_trial_number + 1, self.config.experiment_trials))
+        } else {
+            None
+        }
     }
 }

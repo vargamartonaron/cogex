@@ -46,7 +46,7 @@
       };
 
       devShells.default = pkgs.mkShell {
-        buildInputs = [rustToolchain pkgs.rust-analyzer-nightly pkgs.pkg-config pkgs.openssl];
+        buildInputs = [rustToolchain pkgs.rust-analyzer-nightly pkgs.pkg-config pkgs.openssl pkgs.cargo-flamegraph pkgs.gnuplot];
         LD_LIBRARY_PATH = nixpkgs.lib.makeLibraryPath dlopenLibraries;
       };
     });

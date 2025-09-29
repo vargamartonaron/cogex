@@ -1,11 +1,12 @@
 use anyhow::Result;
 use cogex_core::{Phase, StandardPhase, StimulusType};
-use cogex_experiment::{ExperimentConfig, ExperimentStateMachine};
-use cogex_render::{PhaseRenderer, Renderer, SkiaRenderer};
+use cogex_experiment::{ExperimentConfig, ExperimentEvent, ExperimentStateMachine};
+use cogex_render::{render::FrameStats, SkiaRenderer};
 use cogex_timing::{HighPrecisionTimer, Timer};
 use pixels::{Pixels, SurfaceTexture};
 use rand::rngs::ThreadRng;
 use std::sync::Arc;
+use tiny_skia::Pixmap;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -19,6 +20,7 @@ pub struct App {
     pixels: Option<Pixels<'static>>,
     experiment: ExperimentStateMachine<StandardPhase, StimulusType, HighPrecisionTimer, ThreadRng>,
     renderer: Option<SkiaRenderer>,
+    canvas: Option<Pixmap>,
     icon: Icon,
     current_size: Option<PhysicalSize<u32>>,
     scale_factor: f64,
@@ -34,11 +36,13 @@ impl App {
         let rng = rand::rng();
         let experiment = ExperimentStateMachine::new(config, timer, rng);
         let icon = Self::load_icon(include_bytes!("../../assets/icon.png"));
+
         Ok(Self {
             window: None,
             pixels: None,
             experiment,
             renderer: None,
+            canvas: None,
             icon: icon,
             current_size: None,
             scale_factor: 1.0,
@@ -115,7 +119,12 @@ impl App {
             surface_texture,
         )?);
 
-        self.renderer = Some(SkiaRenderer::new(physical_size.width, physical_size.height));
+        self.canvas = Pixmap::new(physical_size.width, physical_size.height);
+        self.renderer = Some(SkiaRenderer::new(
+            physical_size.width,
+            physical_size.height,
+            self.experiment.config.experiment_trials,
+        ));
 
         window.set_cursor_visible(false);
         window.request_redraw();
@@ -126,34 +135,45 @@ impl App {
     }
 
     fn render(&mut self) -> anyhow::Result<()> {
-        let win_size = self.window.as_ref().unwrap().inner_size();
         let pix = self.pixels.as_mut().unwrap();
-
-        let frame_start = self.experiment.timer.now();
-
-        let frame = pix.frame_mut();
-        let mut canvas = tiny_skia::Pixmap::new(win_size.width, win_size.height).unwrap();
-        self.renderer.as_mut().unwrap().clear(&mut canvas);
+        let renderer = self.renderer.as_mut().unwrap();
 
         let phase = self.experiment.current_phase();
         let stim = self.experiment.current_stimulus();
-        self.renderer
-            .as_mut()
-            .unwrap()
-            .render_phase(&mut canvas, phase, stim, None, None)?;
-        frame.copy_from_slice(canvas.data());
+        let ts = self.experiment.current_trial_state();
+        let prog = self.experiment.trial_progress();
+        let mut timer = self.experiment.timer.clone();
+
+        let frame = pix.frame_mut();
+        let stats: FrameStats = renderer.render_frame(phase, stim, ts, prog, frame, &mut timer)?;
 
         pix.render()?;
 
-        // record frame time
-        let elapsed = self.experiment.timer.elapsed(frame_start);
-        self.experiment.timer.record_frame(elapsed);
+        if self.experiment.phase.requires_calibration() && self.experiment.timer.frame_count() < 300
+        {
+            self.window.as_ref().unwrap().request_redraw(); // schedule next VSync‐driven render
+        }
+
+        println!(
+            "clear {:.3}ms, phase {:.3}ms, copy {:.3}ms, total {:.3}ms, dirty count {:.3}",
+            stats.clear.as_secs_f64() * 1e3,
+            stats.phase.as_secs_f64() * 1e3,
+            stats.copy.as_secs_f64() * 1e3,
+            stats.total.as_secs_f64() * 1e3,
+            stats.dirty_count,
+        );
+
+        self.experiment
+            .handle_event(ExperimentEvent::CalibrationComplete);
 
         Ok(())
     }
 
     fn update(&mut self) -> Result<()> {
-        self.experiment.update();
+        let events = self.experiment.update();
+        for event in events {
+            self.experiment.handle_event(event);
+        }
         Ok(())
     }
 
@@ -163,9 +183,11 @@ impl App {
             match k {
                 KeyCode::Space => {
                     if self.experiment.current_phase().is_welcome() {
-                        self.experiment.advance_phase();
-                    } else if self.experiment.current_phase().allows_input() {
-                        self.experiment.record_response();
+                        self.experiment.handle_event(ExperimentEvent::SpacePressed);
+                    }
+                    if self.experiment.current_phase().allows_input() {
+                        self.experiment
+                            .handle_event(ExperimentEvent::ResponseReceived);
                     }
                 }
                 KeyCode::Escape => self.cleanup_and_exit(event_loop),
@@ -184,9 +206,10 @@ impl App {
                 eprintln!("Failed to resize buffer: {}", e);
             }
         }
-        if let Some(renderer) = &mut self.renderer {
-            *renderer = SkiaRenderer::new(new_size.width, new_size.height);
-        }
+        self.renderer
+            .as_mut()
+            .unwrap()
+            .resize(new_size.width, new_size.height);
         println!("Display resized to: {}×{}", new_size.width, new_size.height);
     }
     fn cleanup_and_exit(&mut self, event_loop: &ActiveEventLoop) {
@@ -195,10 +218,6 @@ impl App {
         }
 
         println!("\nExperiment completed.");
-        println!(
-            "Calibration data samples: {}",
-            self.experiment.timer.frame_times.len()
-        );
         println!("Results saved. Thank you!");
 
         self.should_exit = true;

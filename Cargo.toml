@@ -4,6 +4,7 @@ members = [
   "cogex-timing",
   "cogex-render",
   "cogex-experiment",
-  "cogex-app"
+  "cogex-app",
+  "cogex-cache",
 ]
 resolver = "3"

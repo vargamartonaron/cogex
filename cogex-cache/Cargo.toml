@@ -1,8 +1,9 @@
 [package]
-name = "cogex-core"
+name = "cogex-cache"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cogex-cache = {path = "../cogex-cache"}
+string_cache = "0.9"
+lazy_static = "1.4"
 
