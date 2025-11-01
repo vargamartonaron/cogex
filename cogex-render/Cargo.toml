@@ -8,6 +8,7 @@ bench = []
 
 [dev-dependencies]
 criterion = "0.5"
+pprof = { version = "0.13", features = ["flamegraph" ,"criterion"] }
 
 [dependencies]
 cogex-core = { path = "../cogex-core" }
@@ -16,6 +17,7 @@ cogex-timing = { path = "../cogex-timing"}
 tiny-skia = "0.11"
 ab_glyph = "0.2"
 anyhow = "1.0"
+bytemuck = "1.24"
 
 [profile.release]
 debug = true

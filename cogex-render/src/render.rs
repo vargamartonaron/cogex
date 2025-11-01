@@ -1,5 +1,6 @@
 use ab_glyph::{point, Font, FontRef, Glyph, PxScale, ScaleFont};
 use anyhow::Result;
+use bytemuck::{cast_slice, cast_slice_mut};
 use cogex_cache::{get_text, intern_text, text_count, Atom};
 use cogex_core::{ArrowDirection, Phase, StimulusType, TrialState};
 use cogex_timing::{HighPrecisionTimer, Timer};
@@ -8,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tiny_skia::{
-    Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, PremultipliedColorU8, Rect, Transform,
+    Color, FillRule, FilterQuality, Paint, PathBuilder, Pixmap, PixmapPaint, PremultipliedColorU8,
+    Rect, Transform,
 };
 
 #[repr(usize)]
@@ -27,12 +29,11 @@ enum CacheIndex {
     ArrowStim = 7,
 
     // Fixation cross parts (8-9)
-    FixationH = 8,
-    FixationV = 9,
+    FixationCross = 8,
 }
 
 impl CacheIndex {
-    const STATIC_COUNT: usize = 10;
+    const STATIC_COUNT: usize = 19;
 }
 
 struct TextCache {
@@ -195,15 +196,6 @@ pub trait Renderer {
     fn clear_dirty(&mut self, dirty: &[Rect]);
     fn blit_cached(&mut self, index: usize, pos: (f32, f32));
     fn blit_text_by_intern_id(&mut self, intern_id: usize, pos: (f32, f32));
-    fn draw_circle(&mut self, center: (f32, f32), radius: f32, color: [u8; 4]);
-    fn draw_rect(&mut self, top_left: (f32, f32), size: (f32, f32), color: [u8; 4]);
-    fn draw_arrow(
-        &mut self,
-        position: (f32, f32),
-        direction: ArrowDirection,
-        size: f32,
-        color: [u8; 4],
-    );
 }
 
 pub trait PhaseRenderer<P: Phase>: Renderer {
@@ -223,13 +215,12 @@ pub struct SkiaRenderer {
 
     font: FontRef<'static>,
 
-    // Unified cache system
     static_cache: Vec<Pixmap>,
     static_sizes: Vec<(u32, u32)>,
     text_cache: TextCache,
 
-    // Pre-computed trial progress text intern IDs
     progress_text_interns: Vec<Vec<usize>>, // [trial_count][current_trial]
+    progress_text_pixmaps: Vec<Vec<Arc<Pixmap>>>,
 
     // Rendering state
     canvas: Pixmap,
@@ -267,6 +258,7 @@ impl SkiaRenderer {
             static_sizes: vec![(1, 1); CacheIndex::STATIC_COUNT],
             text_cache: TextCache::new(font, 24.0),
             progress_text_interns: Vec::new(),
+            progress_text_pixmaps: Vec::new(),
             canvas: canvas,
             dirty_regions: Vec::with_capacity(16),
             first_frame: true,
@@ -330,7 +322,7 @@ impl SkiaRenderer {
         self.cache_stimuli();
         self.cache_fixation();
         // Build progress lookup as intern IDs (idempotent, no new strings)
-        self.precompute_progress_lookup(max_trials);
+        self.precompute_progress_pixmaps(max_trials);
     }
 
     fn cache_static_text(&mut self) {
@@ -386,32 +378,33 @@ impl SkiaRenderer {
     }
 
     fn cache_fixation(&mut self) {
-        // Horizontal bar
-        let h_pixmap = self.render_stimulus_to_pixmap(&StimulusType::Rectangle {
-            width: 40.0,
-            height: 2.0,
-            color: [255, 255, 255, 255],
-        });
-        self.static_sizes[CacheIndex::FixationH as usize] = (h_pixmap.width(), h_pixmap.height());
-        self.static_cache[CacheIndex::FixationH as usize] = h_pixmap;
+        let size = 40u32; // full extent of cross
+        let mut pm = Pixmap::new(size, size).unwrap();
 
-        // Vertical bar
-        let v_pixmap = self.render_stimulus_to_pixmap(&StimulusType::Rectangle {
-            width: 2.0,
-            height: 40.0,
-            color: [255, 255, 255, 255],
-        });
-        self.static_sizes[CacheIndex::FixationV as usize] = (v_pixmap.width(), v_pixmap.height());
-        self.static_cache[CacheIndex::FixationV as usize] = v_pixmap;
+        let mut paint = Paint::default();
+        paint.anti_alias = false;
+        paint.set_color(Color::from_rgba8(255, 255, 255, 255));
+
+        // horizontal bar (40x2) centered
+        let h = Rect::from_xywh(0.0, (size as f32 - 2.0) * 0.5, size as f32, 2.0).unwrap();
+        pm.fill_rect(h, &paint, Transform::identity(), None);
+
+        // vertical bar (2x40) centered
+        let v = Rect::from_xywh((size as f32 - 2.0) * 0.5, 0.0, 2.0, size as f32).unwrap();
+        pm.fill_rect(v, &paint, Transform::identity(), None);
+
+        self.static_sizes[CacheIndex::FixationCross as usize] = (pm.width(), pm.height());
+        self.static_cache[CacheIndex::FixationCross as usize] = pm;
     }
 
-    fn precompute_progress_lookup(&mut self, max_trials: usize) {
+    fn precompute_progress_pixmaps(&mut self, max_trials: usize) {
         self.progress_text_interns = Vec::with_capacity(max_trials + 1);
         for total in 0..=max_trials {
-            let mut row = Vec::with_capacity(total + 1);
+            let mut row: Vec<usize> = Vec::with_capacity(total + 1);
             for current in 0..=total {
-                let id = intern_text(&format!("Trial: {}/{}", current, total));
-                row.push(id);
+                let s = format!("Trial: {}/{}", current, total);
+                let intern_id = intern_text(&s);
+                row.push(intern_id);
             }
             self.progress_text_interns.push(row);
         }
@@ -527,7 +520,6 @@ impl SkiaRenderer {
         }
     }
 
-    // Optimized dirty region copying
     fn copy_dirty_region(&self, dirty: Rect, frame_buffer: &mut [u8]) {
         let (x0, y0, x1, y1) = (
             dirty.x().floor().max(0.0).min(self.width as f32) as usize,
@@ -546,10 +538,39 @@ impl SkiaRenderer {
 
         for row in y0..y1 {
             let off = row * row_bytes + x0 * 4;
-            let src = &canvas_data[off..off + bytes];
-            let dst = &mut frame_buffer[off..off + bytes];
-            dst.copy_from_slice(src); // [attached_file:1]
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    canvas_data.as_ptr().add(off),
+                    frame_buffer.as_mut_ptr().add(off),
+                    bytes,
+                );
+            }
         }
+    }
+
+    fn coalesce_dirty(rects: &mut Vec<Rect>) {
+        rects.sort_by(|a, b| {
+            a.y()
+                .partial_cmp(&b.y())
+                .unwrap()
+                .then(a.x().partial_cmp(&b.x()).unwrap())
+        });
+        let mut out: Vec<Rect> = Vec::with_capacity(rects.len());
+        for r in rects.drain(..) {
+            if let Some(last) = out.last_mut() {
+                let same_row =
+                    (r.y() - last.y()).abs() < 1.0 && (r.height() - last.height()).abs() < 1.0;
+                let touching = r.x() <= last.x() + last.width() + 1.0;
+                if same_row && touching {
+                    let nx = last.x().min(r.x());
+                    let nx2 = (last.x() + last.width()).max(r.x() + r.width());
+                    *last = Rect::from_xywh(nx, last.y(), nx2 - nx, last.height()).unwrap();
+                    continue;
+                }
+            }
+            out.push(r);
+        }
+        *rects = out;
     }
 
     pub fn render_frame<P: Phase>(
@@ -580,36 +601,10 @@ impl SkiaRenderer {
             unsafe { std::slice::from_raw_parts(old_dirty.as_ptr(), old_dirty.len()) };
         let t_clear_off = {
             let t = timer.now();
-            self.clear_dirty(clear_slice);
+            SkiaRenderer::clear_dirty(self, clear_slice);
             timer.elapsed(t)
         };
-        // 3) CLEAR old regions on visible frame_buffer
-        let t_clear_vis = {
-            let t = timer.now();
-            let row_bytes = (self.width as usize) * 4;
-            for rect in &old_dirty {
-                let x0 = rect.x().floor().max(0.0).min(self.width as f32) as usize;
-                let y0 = rect.y().floor().max(0.0).min(self.height as f32) as usize;
-                let x1 = (rect.x() + rect.width())
-                    .ceil()
-                    .max(0.0)
-                    .min(self.width as f32) as usize;
-                let y1 = (rect.y() + rect.height())
-                    .ceil()
-                    .max(0.0)
-                    .min(self.height as f32) as usize;
-                let row_pixel_count = x1 - x0;
-                let row_byte_count = row_pixel_count * 4;
-                for y in y0..y1 {
-                    let offset = y * row_bytes + x0 * 4;
-                    // copy from clear_buffer into frame_buffer
-                    let src = &self.clear_buffer[offset..offset + row_byte_count];
-                    let dst = &mut frame_buffer[offset..offset + row_byte_count];
-                    dst.copy_from_slice(src);
-                }
-            }
-            timer.elapsed(t)
-        };
+
         // 4) DRAW new content
         let t_phase = {
             let t = timer.now();
@@ -619,14 +614,20 @@ impl SkiaRenderer {
         // 5) COPY new dirty regions to visible frame_buffer
         let ptr = self.dirty_regions.as_ptr();
         let len = self.dirty_regions.len();
+        let mut present_rects = old_dirty;
+        unsafe {
+            present_rects.extend_from_slice(std::slice::from_raw_parts(ptr, len));
+        }
+        SkiaRenderer::coalesce_dirty(&mut present_rects);
+
         let t_copy = {
             let t = timer.now();
-            for i in 0..len {
-                let rect = unsafe { *ptr.add(i) };
-                self.copy_dirty_region(rect, frame_buffer);
+            for rect in &present_rects {
+                self.copy_dirty_region(*rect, frame_buffer);
             }
             timer.elapsed(t)
         };
+        let t_clear_vis = Duration::ZERO;
         // Record timings
         let total = t_clear_vis + t_clear_off + t_phase + t_copy;
         self.component_timers["phase"]
@@ -648,146 +649,211 @@ impl SkiaRenderer {
             dirty_count: self.dirty_regions.len(),
         })
     }
-}
 
-impl Renderer for SkiaRenderer {
-    fn clear_dirty(&mut self, dirty: &[Rect]) {
-        self.clear_dirty(dirty);
-    }
-
-    fn blit_cached(&mut self, index: usize, pos: (f32, f32)) {
+    fn blit_cached_fast(&mut self, index: usize, pos: (f32, f32)) {
         if index >= self.static_cache.len() {
             return;
         }
 
         let pixmap = &self.static_cache[index];
-        let (w, h) = self.static_sizes[index];
+        let (w_u32, h_u32) = self.static_sizes[index];
+        let w = w_u32 as usize;
+        let h = h_u32 as usize;
 
-        let x = (pos.0 - (w as f32 * 0.5)) as i32;
-        let y = (pos.1 - (h as f32 * 0.5)) as i32;
+        // Compute top-left corner
+        let x0 = (pos.0 - w as f32 * 0.5).floor() as i32;
+        let y0 = (pos.1 - h as f32 * 0.5).floor() as i32;
 
-        let mut paint = PixmapPaint::default();
-        paint.quality = tiny_skia::FilterQuality::Nearest;
+        // // Skip if entirely outside canvas
+        // if x0 >= self.canvas.width() as i32 || y0 >= self.canvas.height() as i32 {
+        //     return;
+        // }
+        // if x0 + w as i32 <= 0 || y0 + h as i32 <= 0 {
+        //     return;
+        // }
 
-        self.canvas
-            .draw_pixmap(x, y, pixmap.as_ref(), &paint, Transform::identity(), None);
+        // Determine source and destination ranges
+        let dst_x_start = x0.max(0) as usize;
+        let dst_y_start = y0.max(0) as usize;
+        let dst_x_end = (x0 + w as i32).min(self.canvas.width() as i32) as usize;
+        let dst_y_end = (y0 + h as i32).min(self.canvas.height() as i32) as usize;
 
-        self.dirty_regions
-            .push(Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).unwrap());
+        let src_x_start = if x0 < 0 { (-x0) as usize } else { 0 };
+        let src_y_start = if y0 < 0 { (-y0) as usize } else { 0 };
+
+        let max_w = dst_x_end - dst_x_start;
+        let max_h = dst_y_end - dst_y_start;
+
+        if max_w == 0 || max_h == 0 {
+            return;
+        }
+
+        let src_data = pixmap.data();
+        let canvas_stride = self.canvas.width() as usize;
+        let dst_data = self.canvas.data_mut();
+
+        let pixmap_stride = pixmap.width() as usize;
+
+        // Check if the region is fully opaque
+        let mut fully_opaque = true;
+        'opaque_check: for y in 0..max_h {
+            let row_start = (src_y_start + y) * pixmap_stride + src_x_start;
+            for x in 0..max_w {
+                let alpha = src_data[(row_start + x) * 4 + 3];
+                if alpha != 255 {
+                    fully_opaque = false;
+                    break 'opaque_check;
+                }
+            }
+        }
+
+        if fully_opaque {
+            // Fast memcpy per row for opaque regions
+            for y in 0..max_h {
+                let src_row_start = (src_y_start + y) * pixmap_stride * 4 + src_x_start * 4;
+                let dst_row_start = (dst_y_start + y) * canvas_stride * 4 + dst_x_start * 4;
+                dst_data[dst_row_start..dst_row_start + max_w * 4]
+                    .copy_from_slice(&src_data[src_row_start..src_row_start + max_w * 4]);
+            }
+        } else {
+            // Blend per pixel (premultiplied)
+            for y in 0..max_h {
+                for x in 0..max_w {
+                    let src_idx = ((src_y_start + y) * pixmap_stride + (src_x_start + x)) * 4;
+                    let dst_idx = ((dst_y_start + y) * canvas_stride + (dst_x_start + x)) * 4;
+
+                    let sa = src_data[src_idx + 3] as u32;
+                    let sr = src_data[src_idx + 0] as u32;
+                    let sg = src_data[src_idx + 1] as u32;
+                    let sb = src_data[src_idx + 2] as u32;
+
+                    let da = dst_data[dst_idx + 3] as u32;
+                    let dr = dst_data[dst_idx + 0] as u32;
+                    let dg = dst_data[dst_idx + 1] as u32;
+                    let db = dst_data[dst_idx + 2] as u32;
+
+                    let inv_a = 255 - sa;
+
+                    dst_data[dst_idx + 0] = (sr + (dr * inv_a + 127) / 255) as u8;
+                    dst_data[dst_idx + 1] = (sg + (dg * inv_a + 127) / 255) as u8;
+                    dst_data[dst_idx + 2] = (sb + (db * inv_a + 127) / 255) as u8;
+                    dst_data[dst_idx + 3] = (sa + (da * inv_a + 127) / 255) as u8;
+                }
+            }
+        }
+
+        self.dirty_regions.push(
+            Rect::from_xywh(
+                dst_x_start as f32,
+                dst_y_start as f32,
+                max_w as f32,
+                max_h as f32,
+            )
+            .unwrap(),
+        );
+    }
+}
+
+impl Renderer for SkiaRenderer {
+    fn clear_dirty(&mut self, dirty: &[Rect]) {
+        SkiaRenderer::clear_dirty(self, dirty);
+    }
+
+    fn blit_cached(&mut self, index: usize, pos: (f32, f32)) {
+        self.blit_cached_fast(index, pos);
     }
 
     fn blit_text_by_intern_id(&mut self, intern_id: usize, pos: (f32, f32)) {
         if intern_id >= text_count() {
             return;
         }
+
         let atom = Atom::from(get_text(intern_id).as_str());
         let pm = self.text_cache.get_or_render(atom);
         let (w, h) = (pm.width(), pm.height());
-        let x = (pos.0 - (w as f32 * 0.5)) as i32;
-        let y = (pos.1 - (h as f32 * 0.5)) as i32;
+        let (cw, ch) = (self.width as usize, self.height as usize);
 
-        let paint = PixmapPaint {
-            opacity: 1.0,
-            quality: tiny_skia::FilterQuality::Nearest,
-            ..Default::default()
+        let x = (pos.0 - w as f32 * 0.5) as i32;
+        let y = (pos.1 - h as f32 * 0.5) as i32;
+
+        // Cull fully off-screen
+        if x + w as i32 <= 0 || y + h as i32 <= 0 || x >= cw as i32 || y >= ch as i32 {
+            return;
+        }
+
+        // Clipping
+        let dst_x = x.max(0) as usize;
+        let dst_y = y.max(0) as usize;
+        let src_x_offset = (-x).max(0) as usize;
+        let src_y_offset = (-y).max(0) as usize;
+        let copy_w = (w as usize - src_x_offset).min(cw - dst_x);
+        let copy_h = (h as usize - src_y_offset).min(ch - dst_y);
+
+        let src_data = pm.data();
+        let dst_data = self.canvas.data_mut();
+        let src_row_bytes = pm.width() as usize * 4;
+
+        // Detect full opacity once
+        let fully_opaque = {
+            let mut opaque = true;
+            for row in 0..copy_h {
+                let start = (src_y_offset + row) * src_row_bytes + src_x_offset * 4;
+                let end = start + copy_w * 4;
+                if src_data[start..end].iter().step_by(4).any(|&a| a != 255) {
+                    opaque = false;
+                    break;
+                }
+            }
+            opaque
         };
-        let pm_ref = (&*pm).as_ref();
-        self.canvas
-            .draw_pixmap(x, y, pm_ref, &paint, Transform::identity(), None);
-        self.dirty_regions
-            .push(Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).unwrap());
-    }
 
-    fn draw_circle(&mut self, center: (f32, f32), radius: f32, color: [u8; 4]) {
-        let mut paint = Paint::default();
-        paint.anti_alias = false;
-        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
+        // Convert rows to u32 slices for fast copying
+        let src_u32 = cast_slice(src_data);
+        let dst_u32 = cast_slice_mut(dst_data);
 
-        let mut pb = PathBuilder::new();
-        pb.push_circle(center.0, center.1, radius);
-
-        self.canvas.fill_path(
-            &pb.finish().unwrap(),
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
-
-        self.dirty_regions.push(
-            Rect::from_xywh(
-                center.0 - radius,
-                center.1 - radius,
-                radius * 2.0,
-                radius * 2.0,
-            )
-            .unwrap(),
-        );
-    }
-
-    fn draw_rect(&mut self, top_left: (f32, f32), size: (f32, f32), color: [u8; 4]) {
-        let mut paint = Paint::default();
-        paint.anti_alias = false;
-        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-
-        let rect = Rect::from_xywh(top_left.0, top_left.1, size.0, size.1).unwrap();
-        self.canvas
-            .fill_rect(rect, &paint, Transform::identity(), None);
-
-        self.dirty_regions.push(rect);
-    }
-
-    fn draw_arrow(
-        &mut self,
-        position: (f32, f32),
-        direction: ArrowDirection,
-        size: f32,
-        color: [u8; 4],
-    ) {
-        let mut paint = Paint::default();
-        paint.anti_alias = false;
-        paint.set_color(Color::from_rgba8(color[0], color[1], color[2], color[3]));
-
-        let mut pb = PathBuilder::new();
-        let (x, y) = position;
-
-        match direction {
-            ArrowDirection::Up => {
-                pb.move_to(x, y - size);
-                pb.line_to(x - size / 2.0, y + size / 2.0);
-                pb.line_to(x + size / 2.0, y + size / 2.0);
-                pb.close();
+        if fully_opaque {
+            for row in 0..copy_h {
+                let src_row_start = (src_y_offset + row) * pm.width() as usize + src_x_offset;
+                let dst_row_start = (dst_y + row) * cw + dst_x;
+                dst_u32[dst_row_start..dst_row_start + copy_w]
+                    .copy_from_slice(&src_u32[src_row_start..src_row_start + copy_w]);
             }
-            ArrowDirection::Down => {
-                pb.move_to(x, y + size);
-                pb.line_to(x - size / 2.0, y - size / 2.0);
-                pb.line_to(x + size / 2.0, y - size / 2.0);
-                pb.close();
-            }
-            ArrowDirection::Left => {
-                pb.move_to(x - size, y);
-                pb.line_to(x + size / 2.0, y - size / 2.0);
-                pb.line_to(x + size / 2.0, y + size / 2.0);
-                pb.close();
-            }
-            ArrowDirection::Right => {
-                pb.move_to(x + size, y);
-                pb.line_to(x - size / 2.0, y - size / 2.0);
-                pb.line_to(x - size / 2.0, y + size / 2.0);
-                pb.close();
+        } else {
+            // Branch-free alpha blending
+            for row in 0..copy_h {
+                let src_row_start = (src_y_offset + row) * pm.width() as usize + src_x_offset;
+                let dst_row_start = (dst_y + row) * cw + dst_x;
+
+                for i in 0..copy_w {
+                    let s = src_u32[src_row_start + i];
+                    let d = dst_u32[dst_row_start + i];
+
+                    let sa = ((s >> 24) as u32 & 0xFF) as u32;
+                    let inv = 255 - sa;
+
+                    // Premultiplied blending
+                    let sr = (s & 0xFF) as u32;
+                    let sg = ((s >> 8) as u32 & 0xFF) as u32;
+                    let sb = ((s >> 16) as u32 & 0xFF) as u32;
+
+                    let dr = (d & 0xFF) as u32;
+                    let dg = ((d >> 8) as u32 & 0xFF) as u32;
+                    let db = ((d >> 16) as u32 & 0xFF) as u32;
+                    let da = ((d >> 24) as u32 & 0xFF) as u32;
+
+                    let r = sr + (dr * inv + 127) / 255;
+                    let g = sg + (dg * inv + 127) / 255;
+                    let b = sb + (db * inv + 127) / 255;
+                    let a = sa + (da * inv + 127) / 255;
+
+                    dst_u32[dst_row_start + i] = (a << 24) | (b << 16) | (g << 8) | r;
+                }
             }
         }
 
-        self.canvas.fill_path(
-            &pb.finish().unwrap(),
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
+        self.dirty_regions.push(
+            Rect::from_xywh(dst_x as f32, dst_y as f32, copy_w as f32, copy_h as f32).unwrap(),
         );
-
-        self.dirty_regions
-            .push(Rect::from_xywh(x - size, y - size, size * 2.0, size * 2.0).unwrap());
     }
 }
 
@@ -813,10 +879,7 @@ where
                 if let Some(state) = trial_state {
                     match state {
                         TrialState::Fixation => {
-                            let cx = self.center.0;
-                            let cy = self.center.1;
-                            self.blit_cached(CacheIndex::FixationH as usize, (cx, cy));
-                            self.blit_cached(CacheIndex::FixationV as usize, (cx, cy));
+                            self.blit_cached(CacheIndex::FixationCross as usize, self.center);
                         }
                         TrialState::Stimulus | TrialState::Response => {
                             if let Some((s, pos)) = stimulus {
@@ -830,7 +893,10 @@ where
                                     StimulusType::Arrow { .. } => {
                                         Some(CacheIndex::ArrowStim as usize)
                                     }
-                                    _ => None,
+                                    other => panic!(
+                                        "unexpected StimType passed to render phase: {:?}",
+                                        other
+                                    ),
                                 } {
                                     self.blit_cached(cache_idx, pos);
                                 }
@@ -853,10 +919,10 @@ where
                         if let Some(intern_id) = self
                             .progress_text_interns
                             .get(total)
-                            .and_then(|r| r.get(current))
-                            .copied()
+                            .and_then(|row| row.get(current))
                         {
-                            self.blit_text_by_intern_id(intern_id, (50.0, 30.0));
+                            let pos = (50.0, 30.0); // same fixed offset as before
+                            self.blit_text_by_intern_id(*intern_id, pos);
                         }
                     }
                 }

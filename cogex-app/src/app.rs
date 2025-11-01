@@ -145,17 +145,20 @@ impl App {
         let mut timer = self.experiment.timer.clone();
 
         let frame = pix.frame_mut();
+
         let stats: FrameStats = renderer.render_frame(phase, stim, ts, prog, frame, &mut timer)?;
-
+        let now = timer.now();
         pix.render()?;
+        let elapsed = timer.elapsed(now);
 
-        if self.experiment.phase.requires_calibration() && self.experiment.timer.frame_count() < 300
+        // if self.experiment.phase.requires_calibration() && self.experiment.timer.frame_count() < 300
         {
             self.window.as_ref().unwrap().request_redraw(); // schedule next VSync‐driven render
         }
 
         println!(
-            "clear {:.3}ms, phase {:.3}ms, copy {:.3}ms, total {:.3}ms, dirty count {:.3}",
+            "outer: {:.3}ms,clear {:.3}ms, phase {:.3}ms, copy {:.3}ms, total {:.3}ms, dirty count {:.3}",
+            elapsed.as_secs_f64() * 1e3,
             stats.clear.as_secs_f64() * 1e3,
             stats.phase.as_secs_f64() * 1e3,
             stats.copy.as_secs_f64() * 1e3,

@@ -338,7 +338,7 @@ where
 
     fn generate_stimulus(&mut self) -> StimulusType {
         // Example: generate a random standard stimulus
-        match self.rng.random_range(0..4) {
+        match self.rng.random_range(0..3) {
             0 => StimulusType::Circle {
                 radius: 50.0,
                 color: [255, 0, 0, 255],
@@ -353,11 +353,16 @@ where
                 size: 60.0,
                 color: [0, 0, 255, 255],
             },
-            _ => StimulusType::Text {
-                content: "Test",
-                size: 24.0,
-                color: [255, 255, 255, 255],
+            _ => StimulusType::Arrow {
+                direction: ArrowDirection::Right,
+                size: 60.0,
+                color: [0, 0, 255, 255],
             },
+            // _ => StimulusType::Text {
+            //     content: "Test",
+            //     size: 24.0,
+            //     color: [255, 255, 255, 255],
+            // },
         }
     }
 
